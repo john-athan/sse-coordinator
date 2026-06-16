@@ -1,6 +1,6 @@
 {
   "name": "sse-coordinator",
-  "version": "0.1.1",
+  "version": "0.2.1",
   "description": "Share a single SSE connection across browser tabs using BroadcastChannel leader election",
   "keywords": ["sse", "server-sent-events", "broadcast-channel", "multi-tab", "leader-election", "eventsource"],
   "license": "MIT",

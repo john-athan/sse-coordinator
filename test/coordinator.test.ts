@@ -5,6 +5,76 @@ import type { SSEEvent } from '../src/types';
 const TEST_URL = 'https://api.example.com/events/stream';
 const TEST_EVENTS = ['message', 'notification.created', 'processing.started'];
 
+/**
+ * Creates a navigator.locks mock that serialises lock requests per name.
+ * The first requestor runs immediately; subsequent requestors queue and run
+ * when the current holder releases (by resolving/returning from its callback).
+ */
+function createLocksMock() {
+  const held = new Map<string, boolean>();
+  const queues = new Map<string, Array<() => void>>();
+
+  const request = (_name: string, optionsOrCallback: any, maybeCallback?: any): Promise<void> => {
+    const hasOptions = typeof optionsOrCallback === 'object' && optionsOrCallback !== null;
+    const options = hasOptions ? optionsOrCallback : {};
+    const callback = hasOptions ? maybeCallback : optionsOrCallback;
+    const signal: AbortSignal | undefined = options.signal;
+
+    return new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+
+      const run = async () => {
+        if (signal?.aborted) {
+          reject(new DOMException('Aborted', 'AbortError'));
+          runNext(_name);
+          return;
+        }
+        held.set(_name, true);
+        try {
+          await callback({});
+          resolve();
+        } catch (e) {
+          reject(e);
+        } finally {
+          held.set(_name, false);
+          runNext(_name);
+        }
+      };
+
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          const q = queues.get(_name);
+          if (q) {
+            const idx = q.indexOf(run);
+            if (idx >= 0) {
+              q.splice(idx, 1);
+              reject(new DOMException('Aborted', 'AbortError'));
+            }
+          }
+        }, { once: true });
+      }
+
+      if (!held.get(_name)) {
+        run();
+      } else {
+        if (!queues.has(_name)) queues.set(_name, []);
+        queues.get(_name)!.push(run);
+      }
+    });
+  };
+
+  const runNext = (name: string) => {
+    const q = queues.get(name) ?? [];
+    const next = q.shift();
+    if (next) next();
+  };
+
+  return { request };
+}
+
 describe('SSECoordinator', () => {
   let coordinator: SSECoordinator;
   let broadcastChannelMock: any;
@@ -30,6 +100,8 @@ describe('SSECoordinator', () => {
     };
 
     globalThis.BroadcastChannel = mock(() => broadcastChannelMock) as any;
+
+    (globalThis as any).navigator = { locks: createLocksMock() };
   });
 
   afterEach(() => {
@@ -38,37 +110,24 @@ describe('SSECoordinator', () => {
   });
 
   describe('Leader Election', () => {
-    it('elects first tab as leader', () => {
+    it('elects first tab as leader immediately', () => {
       coordinator = new SSECoordinator();
       coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-
-      jest.advanceTimersByTime(200);
 
       expect(coordinator.isLeader()).toBe(true);
     });
 
-    it('marks subsequent tabs as followers when leader heartbeat is received', () => {
-      const channelWithCapture: any = {
-        postMessage: mock(() => {}),
-        close: mock(() => {}),
-        addEventListener: mock(() => {}),
-        removeEventListener: mock(() => {}),
-      };
-
-      let capturedHandler: ((e: MessageEvent) => void) | null = null;
-      channelWithCapture.addEventListener = mock((type: string, handler: any) => {
-        if (type === 'message') capturedHandler = handler;
-      });
-
-      globalThis.BroadcastChannel = mock(() => channelWithCapture) as any;
+    it('stays follower when another tab holds the lock', async () => {
+      const leader = new SSECoordinator();
+      leader.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
+      expect(leader.isLeader()).toBe(true);
 
       coordinator = new SSECoordinator();
       coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
 
-      capturedHandler?.({ data: { type: 'heartbeat', tabId: 'existing-leader' } } as MessageEvent);
-      jest.advanceTimersByTime(200);
-
       expect(coordinator.isLeader()).toBe(false);
+
+      leader.disconnect();
     });
   });
 
@@ -103,66 +162,27 @@ describe('SSECoordinator', () => {
         timestamp: new Date().toISOString(),
       };
 
-      coordinator.handleBroadcastMessage({ type: 'sse-event', event });
+      coordinator.handleBroadcastMessage({ type: 'sse-event', tabId: 'other-tab', event });
 
       expect(onEvent).toHaveBeenCalledWith(event);
     });
   });
 
   describe('Leader Failover', () => {
-    it('promotes follower to leader when leader disconnects', () => {
+    it('promotes follower to leader when leader releases the lock', async () => {
+      const leader = new SSECoordinator();
+      leader.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
+      expect(leader.isLeader()).toBe(true);
+
       coordinator = new SSECoordinator();
       coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-
-      jest.advanceTimersByTime(200);
-      coordinator.demoteToFollower();
       expect(coordinator.isLeader()).toBe(false);
 
-      coordinator.handleBroadcastMessage({ type: 'leader-disconnect', tabId: 'old-leader' });
-      jest.advanceTimersByTime(100);
+      leader.disconnect();
 
-      expect(coordinator.isLeader()).toBe(true);
-    });
-
-    it('sends disconnect message when leader closes', () => {
-      coordinator = new SSECoordinator();
-      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-
-      jest.advanceTimersByTime(200);
-      expect(coordinator.isLeader()).toBe(true);
-
-      coordinator.disconnect();
-
-      expect(broadcastChannelMock.postMessage).toHaveBeenCalledWith(
-        expect.objectContaining({ type: 'leader-disconnect' })
-      );
-    });
-  });
-
-  describe('Heartbeat', () => {
-    it('sends heartbeat messages periodically when leader', () => {
-      coordinator = new SSECoordinator();
-      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-
-      jest.advanceTimersByTime(200);
-      expect(coordinator.isLeader()).toBe(true);
-      messages = [];
-
-      jest.advanceTimersByTime(5000);
-
-      expect(messages.filter(m => m.type === 'heartbeat').length).toBeGreaterThan(0);
-    });
-
-    it('detects missing heartbeats and promotes follower', () => {
-      coordinator = new SSECoordinator();
-      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-
-      jest.advanceTimersByTime(200);
-      coordinator.demoteToFollower();
-      expect(coordinator.isLeader()).toBe(false);
-
-      jest.advanceTimersByTime(20001);
-      jest.advanceTimersByTime(101);
+      // The promise chain (releaseLock → runAsLeader resolves → callback resolves →
+      // run() finally → runNext → next callback starts) requires several microtasks.
+      for (let i = 0; i < 5; i++) await Promise.resolve();
 
       expect(coordinator.isLeader()).toBe(true);
     });
@@ -217,7 +237,7 @@ describe('SSECoordinator', () => {
       expect(globalThis.BroadcastChannel).toHaveBeenCalledWith('sse-coordinator');
     });
 
-    it('calls logger.debug when provided', () => {
+    it('calls logger.info when promoted to leader', () => {
       const logger = {
         debug: mock(() => {}),
         info: mock(() => {}),
@@ -227,18 +247,22 @@ describe('SSECoordinator', () => {
 
       coordinator = new SSECoordinator();
       coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, logger, onEvent: () => {} });
-      jest.advanceTimersByTime(200);
 
       expect(logger.info.mock.calls.length).toBeGreaterThan(0);
     });
   });
 
   describe('URL Validation', () => {
-    it('throws on a completely invalid URL', () => {
+    it('throws on a completely invalid URL when no window is available', () => {
+      const originalWindow = globalThis.window;
+      (globalThis as any).window = undefined;
+
       coordinator = new SSECoordinator();
       expect(() =>
         coordinator.connect({ url: 'not a url', eventTypes: TEST_EVENTS, onEvent: () => {} })
       ).toThrow('Invalid URL');
+
+      (globalThis as any).window = originalWindow;
     });
 
     it('throws on a non-http/https URL', () => {
@@ -253,6 +277,17 @@ describe('SSECoordinator', () => {
       expect(() =>
         coordinator.connect({ url: 'http://localhost:3000/events', eventTypes: TEST_EVENTS, onEvent: () => {} })
       ).not.toThrow();
+    });
+
+    it('accepts a relative URL when window is available', () => {
+      (globalThis as any).window = { location: { href: 'https://app.example.com/dashboard' } };
+
+      coordinator = new SSECoordinator();
+      expect(() =>
+        coordinator.connect({ url: '/api/v1/events/stream', eventTypes: TEST_EVENTS, onEvent: () => {} })
+      ).not.toThrow();
+
+      (globalThis as any).window = undefined;
     });
   });
 
@@ -297,35 +332,48 @@ describe('SSECoordinator', () => {
 
       expect(onEvent).not.toHaveBeenCalled();
     });
+
+    it('ignores messages from own tab', () => {
+      const onEvent = mock(() => {});
+      coordinator = new SSECoordinator();
+      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent });
+
+      const ownTabId = (coordinator as any).tabId;
+      const event: SSEEvent = { type: 'x', data: {}, id: '1', timestamp: '' };
+      coordinator.handleBroadcastMessage({ type: 'sse-event', tabId: ownTabId, event });
+
+      expect(onEvent).not.toHaveBeenCalled();
+    });
   });
 
-  describe('Promotion race fix', () => {
-    it('sends an immediate heartbeat when promoted to leader', () => {
+  describe('connection-state relay to followers', () => {
+    it('calls onConnectionChange on follower when leader broadcasts connection-state', () => {
+      const leaderOnChange = mock(() => {});
+      const leader = new SSECoordinator();
+      leader.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {}, onConnectionChange: leaderOnChange });
+
+      const followerOnChange = mock(() => {});
       coordinator = new SSECoordinator();
-      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-      messages = [];
+      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {}, onConnectionChange: followerOnChange });
 
-      jest.advanceTimersByTime(200);
-      expect(coordinator.isLeader()).toBe(true);
+      // Simulate leader broadcasting connection-state
+      coordinator.handleBroadcastMessage({ type: 'connection-state', tabId: 'leader-tab', connected: true });
 
-      const immediateHeartbeats = messages.filter(m => m.type === 'heartbeat');
-      expect(immediateHeartbeats.length).toBeGreaterThan(0);
+      expect(followerOnChange).toHaveBeenCalledWith(true);
+
+      leader.disconnect();
     });
 
-    it('does not promote when a heartbeat arrived during the promotion delay', () => {
+    it('does not call onConnectionChange on leader for connection-state messages', () => {
+      const onChange = mock(() => {});
       coordinator = new SSECoordinator();
-      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-      jest.advanceTimersByTime(200);
-      coordinator.demoteToFollower();
+      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {}, onConnectionChange: onChange });
+      onChange.mockClear();
 
-      coordinator.handleBroadcastMessage({ type: 'leader-disconnect', tabId: 'old-leader' });
+      // Leader should ignore connection-state from others (it manages its own state)
+      coordinator.handleBroadcastMessage({ type: 'connection-state', tabId: 'other-tab', connected: false });
 
-      // Simulate a new leader announcing itself before the promotion timer fires
-      coordinator.handleBroadcastMessage({ type: 'heartbeat', tabId: 'new-leader' });
-
-      jest.advanceTimersByTime(100);
-
-      expect(coordinator.isLeader()).toBe(false);
+      expect(onChange).not.toHaveBeenCalled();
     });
   });
 });

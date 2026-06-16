@@ -52,6 +52,48 @@ class FunctionalEventSourceMock {
   }
 }
 
+function createLocksMock() {
+  const held = new Map<string, boolean>();
+  const queues = new Map<string, Array<() => void>>();
+
+  const runNext = (name: string) => {
+    const q = queues.get(name) ?? [];
+    const next = q.shift();
+    if (next) next();
+  };
+
+  const request = (_name: string, optionsOrCallback: any, maybeCallback?: any): Promise<void> => {
+    const hasOptions = typeof optionsOrCallback === 'object' && optionsOrCallback !== null;
+    const options = hasOptions ? optionsOrCallback : {};
+    const callback = hasOptions ? maybeCallback : optionsOrCallback;
+    const signal: AbortSignal | undefined = options.signal;
+
+    return new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+
+      const run = async () => {
+        if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); runNext(_name); return; }
+        held.set(_name, true);
+        try { await callback({}); resolve(); }
+        catch (e) { reject(e); }
+        finally { held.set(_name, false); runNext(_name); }
+      };
+
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          const q = queues.get(_name);
+          if (q) { const idx = q.indexOf(run); if (idx >= 0) { q.splice(idx, 1); reject(new DOMException('Aborted', 'AbortError')); } }
+        }, { once: true });
+      }
+
+      if (!held.get(_name)) { run(); }
+      else { if (!queues.has(_name)) queues.set(_name, []); queues.get(_name)!.push(run); }
+    });
+  };
+
+  return { request };
+}
+
 let createdEventSources: FunctionalEventSourceMock[] = [];
 let coordinator: SSECoordinator;
 let broadcastChannelMock: any;
@@ -74,6 +116,8 @@ beforeEach(() => {
     removeEventListener: mock(() => {}),
   };
   globalThis.BroadcastChannel = mock(() => broadcastChannelMock) as any;
+
+  (globalThis as any).navigator = { locks: createLocksMock() };
 });
 
 afterEach(() => {
@@ -85,7 +129,6 @@ describe('SSECoordinator - EventSource creation', () => {
   it('creates EventSource without credentials by default when promoted to leader', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     expect(coordinator.isLeader()).toBe(true);
     expect(createdEventSources).toHaveLength(1);
@@ -101,7 +144,6 @@ describe('SSECoordinator - EventSource creation', () => {
       withCredentials: false,
       onEvent: () => {},
     });
-    jest.advanceTimersByTime(200);
 
     expect(createdEventSources[0].withCredentials).toBe(false);
   });
@@ -111,7 +153,6 @@ describe('SSECoordinator - EventSource creation', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {}, onConnectionChange });
 
-    jest.advanceTimersByTime(200);
     createdEventSources[0].fireOpen();
 
     expect(onConnectionChange).toHaveBeenCalledWith(true);
@@ -120,7 +161,6 @@ describe('SSECoordinator - EventSource creation', () => {
   it('resets reconnectAttempts to 0 on successful open', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     (coordinator as any).reconnectAttempts = 5;
     createdEventSources[0].fireOpen();
@@ -133,13 +173,25 @@ describe('SSECoordinator - EventSource creation', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {}, onConnectionChange });
 
-    jest.advanceTimersByTime(200);
     createdEventSources[0].fireOpen();
     onConnectionChange.mockClear();
 
     createdEventSources[0].fireError();
 
     expect(onConnectionChange).toHaveBeenCalledWith(false);
+  });
+
+  it('broadcasts connection-state to followers when EventSource opens', () => {
+    coordinator = new SSECoordinator();
+    coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
+
+    const before = (broadcastChannelMock.postMessage as any).mock.calls.length;
+    createdEventSources[0].fireOpen();
+
+    const newMessages = (broadcastChannelMock.postMessage as any).mock.calls.slice(before);
+    const stateMessages = newMessages.filter((c: any[]) => c[0]?.type === 'connection-state');
+    expect(stateMessages).toHaveLength(1);
+    expect(stateMessages[0][0].connected).toBe(true);
   });
 });
 
@@ -149,7 +201,6 @@ describe('SSECoordinator - event handling', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: e => receivedEvents.push(e) });
 
-    jest.advanceTimersByTime(200);
     createdEventSources[0].fireNamedEvent('processing.request.started', { id: 'req-1' }, 'ev-42');
 
     expect(receivedEvents).toHaveLength(1);
@@ -163,8 +214,6 @@ describe('SSECoordinator - event handling', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
 
-    jest.advanceTimersByTime(200);
-
     const before = (broadcastChannelMock.postMessage as any).mock.calls.length;
     createdEventSources[0].fireNamedEvent('notification.created', { id: 99 });
 
@@ -177,7 +226,6 @@ describe('SSECoordinator - event handling', () => {
   it('does not throw when event data is invalid JSON', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     const handlers = (createdEventSources[0] as any).listeners.get('processing.request.started') ?? [];
     const badEvent = new MessageEvent('processing.request.started', { data: 'not-json', lastEventId: '' });
@@ -194,7 +242,6 @@ describe('SSECoordinator - event handling', () => {
       onEvent: e => receivedEvents.push(e),
     });
 
-    jest.advanceTimersByTime(200);
     createdEventSources[0].fireNamedEvent('notification.created', { id: 1 });
 
     const unregisteredHandlers =
@@ -212,7 +259,7 @@ describe('SSECoordinator - reconnect logic', () => {
     (coordinator as any).isLeaderTab = false;
     (coordinator as any).handleReconnect();
 
-    expect(createdEventSources).toHaveLength(0);
+    expect(createdEventSources).toHaveLength(1); // only the initial one
   });
 
   it('calls onError when max reconnect attempts reached', () => {
@@ -220,7 +267,6 @@ describe('SSECoordinator - reconnect logic', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {}, onError });
 
-    jest.advanceTimersByTime(200);
     (coordinator as any).reconnectAttempts = 10;
     (coordinator as any).handleReconnect();
 
@@ -239,7 +285,6 @@ describe('SSECoordinator - reconnect logic', () => {
       onError,
     });
 
-    jest.advanceTimersByTime(200);
     (coordinator as any).reconnectAttempts = 3;
     (coordinator as any).handleReconnect();
 
@@ -249,7 +294,6 @@ describe('SSECoordinator - reconnect logic', () => {
   it('increments reconnectAttempts on each reconnect', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     const before = (coordinator as any).reconnectAttempts;
     (coordinator as any).handleReconnect();
@@ -260,7 +304,6 @@ describe('SSECoordinator - reconnect logic', () => {
   it('schedules reconnect with exponential backoff', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     const initialSources = createdEventSources.length;
     (coordinator as any).reconnectAttempts = 1;
@@ -273,7 +316,6 @@ describe('SSECoordinator - reconnect logic', () => {
   it('caps reconnect delay at 30 seconds', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     const initialSources = createdEventSources.length;
     (coordinator as any).reconnectAttempts = 9;
@@ -286,7 +328,6 @@ describe('SSECoordinator - reconnect logic', () => {
   it('does not reconnect if no longer leader when timer fires', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     const initialSources = createdEventSources.length;
     (coordinator as any).handleReconnect();
@@ -300,7 +341,6 @@ describe('SSECoordinator - reconnect logic', () => {
   it('cancels pending reconnect timer when disconnect() is called', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     const initialSources = createdEventSources.length;
     (coordinator as any).handleReconnect();
@@ -317,12 +357,11 @@ describe('SSECoordinator - reconnect logic', () => {
 });
 
 describe('SSECoordinator - closeEventSource', () => {
-  it('calls onConnectionChange(false) when eventSource is closed', () => {
+  it('calls onConnectionChange(false) when eventSource is closed via demoteToFollower', () => {
     const onConnectionChange = mock(() => {});
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {}, onConnectionChange });
 
-    jest.advanceTimersByTime(200);
     createdEventSources[0].fireOpen();
     onConnectionChange.mockClear();
 
@@ -334,7 +373,6 @@ describe('SSECoordinator - closeEventSource', () => {
   it('sets eventSource to null after closing', () => {
     coordinator = new SSECoordinator();
     coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
-    jest.advanceTimersByTime(200);
 
     coordinator.demoteToFollower();
 

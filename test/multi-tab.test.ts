@@ -1,13 +1,9 @@
-import { describe, it, expect, beforeEach, afterEach, jest, mock } from 'bun:test';
+import { describe, it, expect, beforeEach, afterEach, mock, jest } from 'bun:test';
 import { SSECoordinator } from '../src/coordinator';
 
 /**
  * Shared BroadcastChannel mock that routes messages between coordinator instances
- * within the same test, simulating real multi-tab behaviour synchronously.
- *
- * Each channel name has a registry of all active message listeners. When any
- * instance calls postMessage, all OTHER instances on the same channel receive
- * the message immediately (synchronous delivery mirrors how fake timers work).
+ * within the same test, simulating real multi-tab behaviour.
  */
 const channelRegistry = new Map<string, Set<(e: MessageEvent) => void>>();
 
@@ -33,7 +29,6 @@ class SharedBroadcastChannel {
 
   postMessage(data: unknown) {
     const event = new MessageEvent('message', { data });
-    // Snapshot before iterating — handlers may remove themselves during delivery
     for (const listener of [...(channelRegistry.get(this.name) ?? [])]) {
       if (!this.ownListeners.includes(listener)) {
         listener(event);
@@ -47,6 +42,57 @@ class SharedBroadcastChannel {
     }
     this.ownListeners = [];
   }
+}
+
+/**
+ * Web Locks mock that serialises lock requests per name.
+ * Mimics the browser: first requestor runs immediately, others queue.
+ * When the holder's async callback resolves (lock released), the next in
+ * queue runs automatically.
+ */
+function createLocksMock() {
+  const held = new Map<string, boolean>();
+  const queues = new Map<string, Array<() => void>>();
+
+  const runNext = (name: string) => {
+    const q = queues.get(name) ?? [];
+    const next = q.shift();
+    if (next) next();
+  };
+
+  const request = (_name: string, optionsOrCallback: any, maybeCallback?: any): Promise<void> => {
+    const hasOptions = typeof optionsOrCallback === 'object' && optionsOrCallback !== null;
+    const options = hasOptions ? optionsOrCallback : {};
+    const callback = hasOptions ? maybeCallback : optionsOrCallback;
+    const signal: AbortSignal | undefined = options.signal;
+
+    return new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); return; }
+
+      const run = async () => {
+        if (signal?.aborted) { reject(new DOMException('Aborted', 'AbortError')); runNext(_name); return; }
+        held.set(_name, true);
+        try { await callback({}); resolve(); }
+        catch (e) { reject(e); }
+        finally { held.set(_name, false); runNext(_name); }
+      };
+
+      if (signal) {
+        signal.addEventListener('abort', () => {
+          const q = queues.get(_name);
+          if (q) {
+            const idx = q.indexOf(run);
+            if (idx >= 0) { q.splice(idx, 1); reject(new DOMException('Aborted', 'AbortError')); }
+          }
+        }, { once: true });
+      }
+
+      if (!held.get(_name)) { run(); }
+      else { if (!queues.has(_name)) queues.set(_name, []); queues.get(_name)!.push(run); }
+    });
+  };
+
+  return { request };
 }
 
 const CHANNEL = 'test-channel';
@@ -72,6 +118,7 @@ beforeEach(() => {
   } as any;
 
   globalThis.BroadcastChannel = SharedBroadcastChannel as any;
+  (globalThis as any).navigator = { locks: createLocksMock() };
 });
 
 afterEach(() => {
@@ -81,15 +128,11 @@ afterEach(() => {
 
 describe('Multi-tab leader election', () => {
   it('elects exactly one leader when three tabs connect simultaneously', () => {
-    // All three connect at the same fake-time instant.
-    // The first coordinator's 200ms timer fires first and its immediate
-    // heartbeat (sent on promotion) cancels the other two timers via the
-    // checkForExistingLeader listener — so only one ever calls promoteToLeader.
+    // Web Locks gives the lock to the first requestor immediately;
+    // the other two queue. No timers needed — election is instant.
     const a = makeCoordinator();
     const b = makeCoordinator();
     const c = makeCoordinator();
-
-    jest.advanceTimersByTime(200);
 
     const leaders = [a, b, c].filter(x => x.isLeader());
     expect(leaders).toHaveLength(1);
@@ -97,23 +140,21 @@ describe('Multi-tab leader election', () => {
     [a, b, c].forEach(x => x.disconnect());
   });
 
-  it('elects exactly one new leader among two followers when the leader disconnects', () => {
-    // Initial election: a, b, c all connect; first one wins.
+  it('elects exactly one new leader among two followers when the leader disconnects', async () => {
     const a = makeCoordinator();
     const b = makeCoordinator();
     const c = makeCoordinator();
 
-    jest.advanceTimersByTime(200);
+    expect([a, b, c].filter(x => x.isLeader())).toHaveLength(1);
 
     const [leader] = [a, b, c].filter(x => x.isLeader());
     const followers = [a, b, c].filter(x => !x.isLeader());
-    expect(followers).toHaveLength(2);
 
-    // Leader disconnects: both followers call attemptPromotion() with a 100ms
-    // timer. When the first follower promotes, its immediate heartbeat updates
-    // the second follower's lastLeaderHeartbeat, preventing it from promoting.
     leader.disconnect();
-    jest.advanceTimersByTime(200);
+
+    // The promise chain (releaseLock → runAsLeader resolves → callback resolves →
+    // run() finally → runNext → next callback starts) requires several microtasks.
+    for (let i = 0; i < 5; i++) await Promise.resolve();
 
     const newLeaders = followers.filter(x => x.isLeader());
     expect(newLeaders).toHaveLength(1);
@@ -121,25 +162,21 @@ describe('Multi-tab leader election', () => {
     followers.forEach(x => x.disconnect());
   });
 
-  it('followers stay as followers while the leader is alive and sending heartbeats', () => {
+  it('followers stay as followers while the leader holds the lock', () => {
     const a = makeCoordinator();
     const b = makeCoordinator();
     const c = makeCoordinator();
 
-    jest.advanceTimersByTime(200);
+    // No amount of time passing changes the lock holder.
+    jest.advanceTimersByTime(60_000);
 
-    // Advance well past HEARTBEAT_TIMEOUT (15 s) — the leader's periodic
-    // heartbeats keep followers from ever attempting promotion.
-    jest.advanceTimersByTime(30_000);
-
-    const leaders = [a, b, c].filter(x => x.isLeader());
-    expect(leaders).toHaveLength(1);
+    expect([a, b, c].filter(x => x.isLeader())).toHaveLength(1);
     expect([a, b, c].filter(x => !x.isLeader())).toHaveLength(2);
 
     [a, b, c].forEach(x => x.disconnect());
   });
 
-  it('fires onConnectionChange(true) on the promoted tab after leader failover', () => {
+  it('fires onConnectionChange(true) on the promoted tab after leader failover', async () => {
     let createdSources: any[] = [];
 
     class TrackingEventSource {
@@ -161,20 +198,22 @@ describe('Multi-tab leader election', () => {
     const b = new SSECoordinator();
     b.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, channelName: CHANNEL, onEvent: () => {}, onConnectionChange: onChangeFollower });
 
-    jest.advanceTimersByTime(200);
-
-    // Only the leader (a) created an EventSource
+    expect(a.isLeader()).toBe(true);
+    expect(b.isLeader()).toBe(false);
     expect(createdSources).toHaveLength(1);
+
     createdSources[0].fireOpen();
     expect(onChangePrimary).toHaveBeenCalledWith(true);
-    expect(onChangeFollower).not.toHaveBeenCalledWith(true);
+    // Follower receives connection-state relay via BroadcastChannel
+    expect(onChangeFollower).toHaveBeenCalledWith(true);
 
     onChangePrimary.mockClear();
+    onChangeFollower.mockClear();
 
-    // Leader disconnects; follower promotes and opens its own EventSource
     a.disconnect();
-    jest.advanceTimersByTime(200);
+    for (let i = 0; i < 5; i++) await Promise.resolve(); // let b acquire the lock
 
+    expect(b.isLeader()).toBe(true);
     expect(createdSources).toHaveLength(2);
     createdSources[1].fireOpen();
     expect(onChangeFollower).toHaveBeenCalledWith(true);
@@ -182,26 +221,33 @@ describe('Multi-tab leader election', () => {
     b.disconnect();
   });
 
-  it('a late-joining tab detects the leader at its next scheduled heartbeat and stays a follower', () => {
-    // a connects and becomes leader, sending an immediate heartbeat at t=200.
+  it('a late-joining tab stays a follower when a leader is already holding the lock', () => {
     const a = makeCoordinator();
-    jest.advanceTimersByTime(200);
     expect(a.isLeader()).toBe(true);
 
-    // Advance to just before a's first scheduled heartbeat (HEARTBEAT_INTERVAL = 5000ms
-    // after promotion, so t=5200). lateB's checkForExistingLeader window is 200ms,
-    // so lateB connects at t=5100 and its window runs t=5100–5300.
-    jest.advanceTimersByTime(4900); // now at t=5100
+    jest.advanceTimersByTime(10_000);
 
     const lateB = makeCoordinator();
-
-    // a's scheduled heartbeat fires at t=5200 (within lateB's election window),
-    // setting hasLeader=true and cancelling lateB's 200ms promotion timer.
-    jest.advanceTimersByTime(400); // now at t=5500
-
-    expect(a.isLeader()).toBe(true);
     expect(lateB.isLeader()).toBe(false);
 
     [a, lateB].forEach(x => x.disconnect());
+  });
+
+  it('follower receives connection-state relay from leader via BroadcastChannel', () => {
+    const followerOnChange = mock(() => {});
+
+    const a = makeCoordinator();
+    const b = new SSECoordinator();
+    b.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, channelName: CHANNEL, onEvent: () => {}, onConnectionChange: followerOnChange });
+
+    expect(a.isLeader()).toBe(true);
+    expect(b.isLeader()).toBe(false);
+
+    // Simulate leader's EventSource opening and broadcasting state
+    b.handleBroadcastMessage({ type: 'connection-state', tabId: (a as any).tabId, connected: true } as any);
+
+    expect(followerOnChange).toHaveBeenCalledWith(true);
+
+    [a, b].forEach(x => x.disconnect());
   });
 });

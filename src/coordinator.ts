@@ -1,15 +1,12 @@
 import type { SSECoordinatorOptions, SSEEvent } from './types';
 
 const DEFAULT_CHANNEL_NAME = 'sse-coordinator';
-const HEARTBEAT_INTERVAL = 5000;
-const HEARTBEAT_TIMEOUT = 15000;
-const PROMOTION_DELAY = 100;
 
 interface BroadcastMessage {
-  type: 'sse-event' | 'heartbeat' | 'leader-disconnect';
-  tabId?: string;
+  type: 'sse-event' | 'connection-state';
+  tabId: string;
   event?: SSEEvent;
-  timestamp?: number;
+  connected?: boolean;
 }
 
 export class SSECoordinator {
@@ -18,14 +15,12 @@ export class SSECoordinator {
   private isLeaderTab = false;
   private tabId: string;
   private currentOptions: SSECoordinatorOptions | null = null;
-  private heartbeatInterval: number | null = null;
-  private heartbeatMonitorId: number | null = null;
-  private reconnectTimeoutId: number | null = null;
-  private lastLeaderHeartbeat: number = Date.now();
+  private releaseLock: (() => void) | null = null;
+  private lockAbortController: AbortController | null = null;
   private reconnectAttempts = 0;
+  private reconnectTimeoutId: number | null = null;
 
   constructor() {
-    // crypto.randomUUID() is preferred; fall back for environments that don't support it
     this.tabId = `tab-${
       typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
         ? crypto.randomUUID()
@@ -34,10 +29,10 @@ export class SSECoordinator {
   }
 
   connect(options: SSECoordinatorOptions): void {
-    // Validate URL before doing anything
     let parsedUrl: URL;
     try {
-      parsedUrl = new URL(options.url);
+      const base = typeof window !== 'undefined' ? window.location.href : undefined;
+      parsedUrl = new URL(options.url, base);
     } catch {
       throw new Error(`Invalid URL: ${options.url}`);
     }
@@ -45,59 +40,63 @@ export class SSECoordinator {
       throw new Error(`URL must use http or https protocol: ${options.url}`);
     }
 
-    // Guard against double-connect: clean up any existing resources
     if (this.channel) {
-      this.closeEventSource();
-      this.stopHeartbeat();
-      this.stopHeartbeatMonitoring();
-      this.stopReconnectTimer();
-      this.channel.close();
-      this.channel = null;
-      this.isLeaderTab = false;
-      this.reconnectAttempts = 0;
+      this.cleanup();
     }
 
     this.currentOptions = options;
-    this.lastLeaderHeartbeat = Date.now();
-
     const channelName = options.channelName ?? DEFAULT_CHANNEL_NAME;
+    const lockName = `${channelName}-leader`;
+
     this.channel = new BroadcastChannel(channelName);
     this.channel.addEventListener('message', this.handleBroadcastMessage.bind(this));
 
-    this.checkForExistingLeader();
-    this.startHeartbeatMonitoring();
+    this.lockAbortController = new AbortController();
+
+    // Browser ensures exactly one tab holds the lock at a time.
+    // Other tabs queue automatically and take over when the leader releases.
+    navigator.locks.request(
+      lockName,
+      { signal: this.lockAbortController.signal },
+      async () => {
+        await this.runAsLeader();
+      }
+    ).catch((e: Error) => {
+      if (e.name !== 'AbortError') {
+        this.log('error', `Lock request failed: ${e.message}`);
+      }
+    });
   }
 
   disconnect(): void {
-    if (this.isLeaderTab) {
-      this.broadcast({ type: 'leader-disconnect', tabId: this.tabId });
-    }
-
-    this.closeEventSource();
-    this.stopHeartbeat();
-    this.stopHeartbeatMonitoring();
-    this.stopReconnectTimer();
-
-    if (this.channel) {
-      this.channel.close();
-      this.channel = null;
-    }
-
-    this.currentOptions = null;
+    this.lockAbortController?.abort(); // cancel pending lock request if still queued
+    this.releaseLock?.();              // release held lock if leader
+    this.cleanup();
   }
 
   isLeader(): boolean {
     return this.isLeaderTab;
   }
 
+  // Kept as public API for edge cases and testing.
+  // Releases leadership so the next queued tab can take over.
+  demoteToFollower(): void {
+    if (!this.isLeaderTab) return;
+    this.log('info', 'Demoting to follower');
+    this.isLeaderTab = false;
+    this.closeEventSource();
+    this.releaseLock?.();
+    this.releaseLock = null;
+  }
+
   broadcastEvent(event: SSEEvent): void {
     this.broadcast({ type: 'sse-event', event });
   }
 
-  handleBroadcastMessage(messageOrEvent: BroadcastMessage | MessageEvent): void {
+  handleBroadcastMessage(messageOrEvent: BroadcastMessage | { data: unknown }): void {
     const raw: unknown =
       messageOrEvent && typeof messageOrEvent === 'object' && 'data' in messageOrEvent
-        ? (messageOrEvent as MessageEvent).data
+        ? (messageOrEvent as { data: unknown }).data
         : messageOrEvent;
 
     if (!this.isValidBroadcastMessage(raw)) return;
@@ -112,77 +111,28 @@ export class SSECoordinator {
         }
         break;
 
-      case 'heartbeat':
-        this.lastLeaderHeartbeat = Date.now();
-        if (this.isLeaderTab && message.tabId !== this.tabId) {
-          this.log('debug', 'Another leader detected, demoting to follower');
-          this.demoteToFollower();
+      case 'connection-state':
+        if (!this.isLeaderTab && message.connected !== undefined) {
+          this.currentOptions?.onConnectionChange?.(message.connected);
         }
-        break;
-
-      case 'leader-disconnect':
-        this.log('debug', 'Leader disconnected, attempting promotion');
-        this.attemptPromotion();
         break;
     }
   }
 
-  demoteToFollower(): void {
-    if (!this.isLeaderTab) return;
-    this.log('info', 'Demoting to follower');
-    this.isLeaderTab = false;
-    this.closeEventSource();
-    this.stopHeartbeat();
+  private async runAsLeader(): Promise<void> {
+    this.isLeaderTab = true;
+    this.reconnectAttempts = 0;
+    this.log('info', 'Promoting to leader');
+    this.createEventSource();
+    return new Promise<void>(resolve => {
+      this.releaseLock = resolve;
+    });
   }
 
   private isValidBroadcastMessage(msg: unknown): msg is BroadcastMessage {
     if (!msg || typeof msg !== 'object') return false;
     const m = msg as Record<string, unknown>;
-    return m.type === 'sse-event' || m.type === 'heartbeat' || m.type === 'leader-disconnect';
-  }
-
-  private checkForExistingLeader(): void {
-    let hasLeader = false;
-
-    const checkTimeout = setTimeout(() => {
-      this.channel?.removeEventListener('message', handleMessage);
-      if (!hasLeader) {
-        this.promoteToLeader();
-      }
-    }, 200);
-
-    const handleMessage = (e: MessageEvent) => {
-      const message: BroadcastMessage = e.data;
-      if (message.type === 'heartbeat') {
-        hasLeader = true;
-        clearTimeout(checkTimeout);
-        this.channel?.removeEventListener('message', handleMessage);
-        this.lastLeaderHeartbeat = Date.now();
-      }
-    };
-
-    this.channel?.addEventListener('message', handleMessage);
-  }
-
-  private promoteToLeader(): void {
-    if (this.isLeaderTab) return;
-    this.log('info', 'Promoting to leader');
-    this.isLeaderTab = true;
-    this.createEventSource();
-    this.startHeartbeat();
-    // Announce leadership immediately so other tabs don't also promote
-    this.broadcast({ type: 'heartbeat', tabId: this.tabId, timestamp: Date.now() });
-  }
-
-  private attemptPromotion(): void {
-    const heartbeatAtStart = this.lastLeaderHeartbeat;
-    setTimeout(() => {
-      // Only promote if no new leader heartbeat arrived since we started waiting
-      const newLeaderAnnounced = this.lastLeaderHeartbeat > heartbeatAtStart;
-      if (!this.isLeaderTab && !newLeaderAnnounced) {
-        this.promoteToLeader();
-      }
-    }, PROMOTION_DELAY);
+    return m.type === 'sse-event' || m.type === 'connection-state';
   }
 
   private createEventSource(): void {
@@ -194,6 +144,7 @@ export class SSECoordinator {
     this.eventSource.onopen = () => {
       this.reconnectAttempts = 0;
       this.currentOptions?.onConnectionChange?.(true);
+      this.broadcast({ type: 'connection-state', connected: true });
       this.log('debug', 'Leader connection established');
     };
 
@@ -216,6 +167,7 @@ export class SSECoordinator {
 
     this.eventSource.onerror = () => {
       this.currentOptions?.onConnectionChange?.(false);
+      this.broadcast({ type: 'connection-state', connected: false });
       this.log('warn', 'Leader connection error');
       this.handleReconnect();
     };
@@ -227,6 +179,20 @@ export class SSECoordinator {
       this.eventSource = null;
       this.currentOptions?.onConnectionChange?.(false);
     }
+  }
+
+  private cleanup(): void {
+    this.closeEventSource();
+    this.stopReconnectTimer();
+    if (this.channel) {
+      this.channel.close();
+      this.channel = null;
+    }
+    this.isLeaderTab = false;
+    this.releaseLock = null;
+    this.lockAbortController = null;
+    this.currentOptions = null;
+    this.reconnectAttempts = 0;
   }
 
   private handleReconnect(): void {
@@ -253,38 +219,6 @@ export class SSECoordinator {
     }, delay) as unknown as number;
   }
 
-  private startHeartbeat(): void {
-    this.stopHeartbeat();
-    this.heartbeatInterval = setInterval(() => {
-      this.broadcast({ type: 'heartbeat', tabId: this.tabId, timestamp: Date.now() });
-    }, HEARTBEAT_INTERVAL) as unknown as number;
-  }
-
-  private stopHeartbeat(): void {
-    if (this.heartbeatInterval) {
-      clearInterval(this.heartbeatInterval);
-      this.heartbeatInterval = null;
-    }
-  }
-
-  private startHeartbeatMonitoring(): void {
-    this.stopHeartbeatMonitoring();
-    this.heartbeatMonitorId = setInterval(() => {
-      if (this.isLeaderTab) return;
-      if (Date.now() - this.lastLeaderHeartbeat > HEARTBEAT_TIMEOUT) {
-        this.log('warn', 'Leader heartbeat timeout, attempting promotion');
-        this.attemptPromotion();
-      }
-    }, HEARTBEAT_INTERVAL) as unknown as number;
-  }
-
-  private stopHeartbeatMonitoring(): void {
-    if (this.heartbeatMonitorId) {
-      clearInterval(this.heartbeatMonitorId);
-      this.heartbeatMonitorId = null;
-    }
-  }
-
   private stopReconnectTimer(): void {
     if (this.reconnectTimeoutId) {
       clearTimeout(this.reconnectTimeoutId);
@@ -292,7 +226,7 @@ export class SSECoordinator {
     }
   }
 
-  private broadcast(message: BroadcastMessage): void {
+  private broadcast(message: Omit<BroadcastMessage, 'tabId'>): void {
     this.channel?.postMessage({ ...message, tabId: this.tabId });
   }
 
