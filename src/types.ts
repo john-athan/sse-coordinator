@@ -26,6 +26,13 @@ export interface SSECoordinatorOptions {
   parseJson?: boolean;
   maxReconnectAttempts?: number;
   /**
+   * Keep retrying forever (at the capped backoff interval) instead of giving up
+   * after `maxReconnectAttempts`. `onError` is still called once when the cap is
+   * first reached, but the leader keeps attempting to reconnect for as long as
+   * the tab is open. Recommended for long-lived real-time UIs. Default `false`.
+   */
+  reconnectForever?: boolean;
+  /**
    * When set, the most recent event id is appended to the connection URL as
    * this query parameter on every (re)connect and on leader handover, letting
    * a cooperating server resume the stream from where it left off. The server

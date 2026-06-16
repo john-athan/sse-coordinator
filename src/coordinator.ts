@@ -27,7 +27,10 @@ export class SSECoordinator {
   private lockAbortController: AbortController | null = null;
   private reconnectAttempts = 0;
   private reconnectTimeoutId: number | null = null;
+  private reconnectGaveUp = false;
   private lastEventId: string | null = null;
+  private onVisibilityChange: (() => void) | null = null;
+  private onOnline: (() => void) | null = null;
 
   constructor() {
     this.tabId = `tab-${
@@ -54,6 +57,12 @@ export class SSECoordinator {
     }
 
     this.currentOptions = options;
+
+    // Recover the connection when the tab regains focus or the network comes
+    // back. Background tabs are frozen and machines sleep, both of which leave
+    // the EventSource dead with the backoff timer throttled or already given
+    // up. These events are the reliable signal that it's worth trying again.
+    this.registerRecoveryListeners();
 
     // The Web Locks API is what guarantees a single leader across tabs. Without
     // it there is no safe way to coordinate, so degrade to standalone: this tab
@@ -152,12 +161,14 @@ export class SSECoordinator {
   private runStandalone(): void {
     this.isLeaderTab = true;
     this.reconnectAttempts = 0;
+    this.reconnectGaveUp = false;
     this.createEventSource();
   }
 
   private async runAsLeader(): Promise<void> {
     this.isLeaderTab = true;
     this.reconnectAttempts = 0;
+    this.reconnectGaveUp = false;
     this.log('info', 'Promoting to leader');
     this.createEventSource();
     return new Promise<void>(resolve => {
@@ -179,6 +190,7 @@ export class SSECoordinator {
 
     this.eventSource.onopen = () => {
       this.reconnectAttempts = 0;
+      this.reconnectGaveUp = false;
       this.currentOptions?.onConnectionChange?.(true);
       this.broadcast({ type: 'connection-state', connected: true });
       this.log('debug', 'Leader connection established');
@@ -247,6 +259,7 @@ export class SSECoordinator {
   private cleanup(): void {
     this.closeEventSource();
     this.stopReconnectTimer();
+    this.removeRecoveryListeners();
     if (this.channel) {
       this.channel.close();
       this.channel = null;
@@ -256,6 +269,7 @@ export class SSECoordinator {
     this.lockAbortController = null;
     this.currentOptions = null;
     this.reconnectAttempts = 0;
+    this.reconnectGaveUp = false;
     this.lastEventId = null;
   }
 
@@ -263,13 +277,26 @@ export class SSECoordinator {
     if (!this.isLeaderTab || !this.currentOptions) return;
 
     const maxAttempts = this.currentOptions.maxReconnectAttempts ?? 10;
+    const reconnectForever = this.currentOptions.reconnectForever ?? false;
+
     if (this.reconnectAttempts >= maxAttempts) {
-      this.log('warn', 'Max reconnection attempts reached');
-      this.currentOptions.onError?.(new Error('Max reconnection attempts reached'));
-      return;
+      if (!this.reconnectGaveUp) {
+        this.reconnectGaveUp = true;
+        this.log(
+          'warn',
+          reconnectForever
+            ? 'Max reconnection attempts reached; continuing to retry at capped interval'
+            : 'Max reconnection attempts reached'
+        );
+        this.currentOptions.onError?.(new Error('Max reconnection attempts reached'));
+      }
+      // When not retrying forever, stop here. Recovery can still be triggered by
+      // a focus/online event via recoverConnection().
+      if (!reconnectForever) return;
+    } else {
+      this.reconnectAttempts++;
     }
 
-    this.reconnectAttempts++;
     const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
     this.log('debug', `Reconnecting in ${delay}ms (attempt ${this.reconnectAttempts}/${maxAttempts})`);
 
@@ -288,6 +315,50 @@ export class SSECoordinator {
       clearTimeout(this.reconnectTimeoutId);
       this.reconnectTimeoutId = null;
     }
+  }
+
+  private registerRecoveryListeners(): void {
+    if (typeof document !== 'undefined' && typeof document.addEventListener === 'function') {
+      if (!this.onVisibilityChange) {
+        this.onVisibilityChange = () => {
+          if (document.visibilityState === 'visible') this.recoverConnection();
+        };
+        document.addEventListener('visibilitychange', this.onVisibilityChange);
+      }
+    }
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      if (!this.onOnline) {
+        this.onOnline = () => this.recoverConnection();
+        window.addEventListener('online', this.onOnline);
+      }
+    }
+  }
+
+  private removeRecoveryListeners(): void {
+    if (this.onVisibilityChange && typeof document !== 'undefined') {
+      document.removeEventListener('visibilitychange', this.onVisibilityChange);
+    }
+    this.onVisibilityChange = null;
+    if (this.onOnline && typeof window !== 'undefined') {
+      window.removeEventListener('online', this.onOnline);
+    }
+    this.onOnline = null;
+  }
+
+  // Force an immediate reconnect if we are the leader and the connection is not
+  // currently open. Triggered by tab focus or network-online — the moments when
+  // a silently-dead connection should be revived without waiting on (or despite
+  // having exhausted) the exponential-backoff timer.
+  private recoverConnection(): void {
+    if (!this.isLeaderTab || !this.currentOptions) return;
+    const isOpen = this.eventSource != null && this.eventSource.readyState === 1;
+    if (isOpen) return;
+    this.log('info', 'Recovering connection after focus/online');
+    this.reconnectAttempts = 0;
+    this.reconnectGaveUp = false;
+    this.stopReconnectTimer();
+    this.closeEventSource();
+    this.createEventSource();
   }
 
   private broadcast(message: Omit<BroadcastMessage, 'tabId'>): void {

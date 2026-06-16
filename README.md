@@ -80,7 +80,8 @@ Starts the coordinator. The tab will either become leader (opening an `EventSour
 | `channelName` | `string` | | `'sse-coordinator'` | BroadcastChannel name — must match across tabs |
 | `withCredentials` | `boolean` | | `false` | Pass cookies with the EventSource request |
 | `parseJson` | `boolean` | | `true` | `JSON.parse` event data; set `false` to receive the raw string (plain-text/custom streams) |
-| `maxReconnectAttempts` | `number` | | `10` | Max reconnection attempts before calling `onError` |
+| `maxReconnectAttempts` | `number` | | `10` | Max reconnection attempts before calling `onError` (and, unless `reconnectForever`, giving up) |
+| `reconnectForever` | `boolean` | | `false` | Keep retrying at the capped interval after `maxReconnectAttempts` instead of giving up. `onError` still fires once when the cap is reached |
 | `lastEventIdParam` | `string` | | none | Query param to carry the last event id on reconnect/handover so a cooperating server can resume the stream |
 | `logger` | `Logger` | | none | Optional logger (`{ debug, info, warn, error }`) |
 | `onError` | `(error: Error) => void` | | — | Called when max reconnections are exceeded |
@@ -110,8 +111,9 @@ interface SSEEvent {
 1. **Leader election** — on `connect()`, every tab requests the same named lock via the [Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API). The browser grants it to exactly one tab, which becomes leader and opens the `EventSource`. The rest queue.
 2. **Event fan-out** — the leader publishes each SSE event over a `BroadcastChannel`; followers receive them with zero extra connections.
 3. **Failover** — when the leader tab closes *or crashes*, the browser releases the lock and grants it to the next queued tab, which promotes itself automatically. No heartbeats, no timeouts.
-4. **Reconnection** — the leader reconnects with exponential backoff (capped at 30 seconds) up to `maxReconnectAttempts`.
-5. **Standalone fallback** — if the Web Locks API is unavailable, coordination is impossible, so each tab runs its own `EventSource` and logs a warning. Functionality is preserved; the shared-connection optimization is not.
+4. **Reconnection** — the leader reconnects with exponential backoff (capped at 30 seconds) up to `maxReconnectAttempts` (or forever, with `reconnectForever`).
+5. **Focus / online recovery** — when the tab regains focus (`visibilitychange`) or the network returns (`online`), the leader immediately revives a dead connection, resetting the backoff. This recovers from frozen background tabs and machine sleep, where the backoff timer is throttled or has already given up.
+6. **Standalone fallback** — if the Web Locks API is unavailable, coordination is impossible, so each tab runs its own `EventSource` and logs a warning. Functionality is preserved; the shared-connection optimization is not.
 
 ## Multiple Apps on the Same Domain
 
