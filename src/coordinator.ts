@@ -2,6 +2,14 @@ import type { SSECoordinatorOptions, SSEEvent } from './types';
 
 const DEFAULT_CHANNEL_NAME = 'sse-coordinator';
 
+function hasWebLocks(): boolean {
+  return (
+    typeof navigator !== 'undefined' &&
+    navigator.locks != null &&
+    typeof navigator.locks.request === 'function'
+  );
+}
+
 interface BroadcastMessage {
   type: 'sse-event' | 'connection-state';
   tabId: string;
@@ -40,11 +48,26 @@ export class SSECoordinator {
       throw new Error(`URL must use http or https protocol: ${options.url}`);
     }
 
-    if (this.channel) {
+    if (this.channel || this.isLeaderTab) {
       this.cleanup();
     }
 
     this.currentOptions = options;
+
+    // The Web Locks API is what guarantees a single leader across tabs. Without
+    // it there is no safe way to coordinate, so degrade to standalone: this tab
+    // runs its own EventSource. Every tab does the same — no shared connection,
+    // but the app keeps working. (Web Locks is in all evergreen browsers;
+    // notable gaps are Firefox < 96 and any pre-15.4 Safari.)
+    if (!hasWebLocks()) {
+      this.log(
+        'warn',
+        'Web Locks API unavailable; running standalone (one connection per tab, no cross-tab coordination)'
+      );
+      this.runStandalone();
+      return;
+    }
+
     const channelName = options.channelName ?? DEFAULT_CHANNEL_NAME;
     const lockName = `${channelName}-leader`;
 
@@ -117,6 +140,15 @@ export class SSECoordinator {
         }
         break;
     }
+  }
+
+  // Degraded path when the Web Locks API is unavailable: become an
+  // uncoordinated leader with a private EventSource. There is no channel and
+  // no failover — each tab is on its own.
+  private runStandalone(): void {
+    this.isLeaderTab = true;
+    this.reconnectAttempts = 0;
+    this.createEventSource();
   }
 
   private async runAsLeader(): Promise<void> {

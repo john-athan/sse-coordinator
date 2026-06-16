@@ -86,7 +86,7 @@ Starts the coordinator. The tab will either become leader (opening an `EventSour
 
 ### `coordinator.disconnect()`
 
-Closes the connection and BroadcastChannel. If this tab is the leader, broadcasts a disconnect message so a follower can take over.
+Closes the connection and BroadcastChannel. If this tab is the leader, it releases the leader lock so a queued tab is promoted automatically.
 
 ### `coordinator.isLeader()`
 
@@ -105,10 +105,11 @@ interface SSEEvent {
 
 ## How It Works
 
-1. **Leader election** — on `connect()`, the tab waits 200ms for a heartbeat from an existing leader. If none arrives, it promotes itself.
-2. **Heartbeat** — the leader broadcasts a heartbeat every 5 seconds. Followers monitor this.
-3. **Failover** — if no heartbeat is received for 15 seconds, a follower promotes itself. When a leader tab closes cleanly, it sends a `leader-disconnect` message to trigger immediate promotion.
+1. **Leader election** — on `connect()`, every tab requests the same named lock via the [Web Locks API](https://developer.mozilla.org/en-US/docs/Web/API/Web_Locks_API). The browser grants it to exactly one tab, which becomes leader and opens the `EventSource`. The rest queue.
+2. **Event fan-out** — the leader publishes each SSE event over a `BroadcastChannel`; followers receive them with zero extra connections.
+3. **Failover** — when the leader tab closes *or crashes*, the browser releases the lock and grants it to the next queued tab, which promotes itself automatically. No heartbeats, no timeouts.
 4. **Reconnection** — the leader reconnects with exponential backoff (capped at 30 seconds) up to `maxReconnectAttempts`.
+5. **Standalone fallback** — if the Web Locks API is unavailable, coordination is impossible, so each tab runs its own `EventSource` and logs a warning. Functionality is preserved; the shared-connection optimization is not.
 
 ## Multiple Apps on the Same Domain
 
@@ -125,7 +126,7 @@ coordinator.connect({
 
 ## Browser Support
 
-Requires [BroadcastChannel API](https://caniuse.com/broadcastchannel) and [`crypto.randomUUID()`](https://caniuse.com/mdn-api_crypto_randomuuid) — supported in Chrome 92+, Firefox 95+, Safari 15.4+, Edge 92+.
+Requires the [BroadcastChannel API](https://caniuse.com/broadcastchannel) and the [Web Locks API](https://caniuse.com/mdn-api_lockmanager) — both available in Chrome 69+, Firefox 96+, Safari 15.4+, and Edge 79+. Where the Web Locks API is missing, the coordinator falls back to one `EventSource` per tab (see "How It Works" → Standalone fallback). `crypto.randomUUID()` is used when present, with a `Math.random()` fallback otherwise.
 
 ## License
 

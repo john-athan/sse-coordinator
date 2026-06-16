@@ -376,4 +376,72 @@ describe('SSECoordinator', () => {
       expect(onChange).not.toHaveBeenCalled();
     });
   });
+
+  describe('Web Locks unavailable (standalone fallback)', () => {
+    it('does not throw and becomes standalone leader when navigator.locks is missing', () => {
+      (globalThis as any).navigator = {};
+      coordinator = new SSECoordinator();
+
+      expect(() =>
+        coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} })
+      ).not.toThrow();
+      expect(coordinator.isLeader()).toBe(true);
+    });
+
+    it('does not throw when navigator itself is undefined', () => {
+      const originalNavigator = (globalThis as any).navigator;
+      (globalThis as any).navigator = undefined;
+      coordinator = new SSECoordinator();
+
+      expect(() =>
+        coordinator.connect({ url: 'http://localhost/events', eventTypes: TEST_EVENTS, onEvent: () => {} })
+      ).not.toThrow();
+      expect(coordinator.isLeader()).toBe(true);
+
+      (globalThis as any).navigator = originalNavigator;
+    });
+
+    it('opens its own EventSource in standalone mode', () => {
+      (globalThis as any).navigator = {};
+      coordinator = new SSECoordinator();
+      const spy = mock(() => {});
+      (coordinator as any).createEventSource = spy;
+
+      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
+
+      expect(spy).toHaveBeenCalled();
+    });
+
+    it('warns that it is running standalone', () => {
+      (globalThis as any).navigator = {};
+      const logger = { debug: mock(() => {}), info: mock(() => {}), warn: mock(() => {}), error: mock(() => {}) };
+      coordinator = new SSECoordinator();
+
+      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, logger, onEvent: () => {} });
+
+      expect(logger.warn.mock.calls.length).toBeGreaterThan(0);
+    });
+
+    it('does not open a BroadcastChannel in standalone mode', () => {
+      (globalThis as any).navigator = {};
+      (globalThis.BroadcastChannel as any).mockClear?.();
+      coordinator = new SSECoordinator();
+
+      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
+
+      expect((globalThis.BroadcastChannel as any).mock.calls.length).toBe(0);
+    });
+
+    it('disconnect() in standalone closes the EventSource without throwing', () => {
+      (globalThis as any).navigator = {};
+      coordinator = new SSECoordinator();
+      coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
+
+      const closeSpy = mock(() => {});
+      (coordinator as any).closeEventSource = closeSpy;
+
+      expect(() => coordinator.disconnect()).not.toThrow();
+      expect(closeSpy).toHaveBeenCalled();
+    });
+  });
 });
