@@ -79,7 +79,9 @@ Starts the coordinator. The tab will either become leader (opening an `EventSour
 | `onEvent` | `(event: SSEEvent) => void` | ✓ | — | Called for every SSE event |
 | `channelName` | `string` | | `'sse-coordinator'` | BroadcastChannel name — must match across tabs |
 | `withCredentials` | `boolean` | | `false` | Pass cookies with the EventSource request |
+| `parseJson` | `boolean` | | `true` | `JSON.parse` event data; set `false` to receive the raw string (plain-text/custom streams) |
 | `maxReconnectAttempts` | `number` | | `10` | Max reconnection attempts before calling `onError` |
+| `lastEventIdParam` | `string` | | none | Query param to carry the last event id on reconnect/handover so a cooperating server can resume the stream |
 | `logger` | `Logger` | | none | Optional logger (`{ debug, info, warn, error }`) |
 | `onError` | `(error: Error) => void` | | — | Called when max reconnections are exceeded |
 | `onConnectionChange` | `(connected: boolean) => void` | | — | Called when the leader's connection opens or closes |

@@ -27,6 +27,7 @@ export class SSECoordinator {
   private lockAbortController: AbortController | null = null;
   private reconnectAttempts = 0;
   private reconnectTimeoutId: number | null = null;
+  private lastEventId: string | null = null;
 
   constructor() {
     this.tabId = `tab-${
@@ -130,6 +131,9 @@ export class SSECoordinator {
     switch (message.type) {
       case 'sse-event':
         if (message.event && this.currentOptions) {
+          // Track the id even as a follower, so a resume URL is correct if this
+          // tab is later promoted to leader.
+          if (message.event.id) this.lastEventId = message.event.id;
           this.currentOptions.onEvent(message.event);
         }
         break;
@@ -170,8 +174,8 @@ export class SSECoordinator {
   private createEventSource(): void {
     if (this.eventSource || !this.currentOptions) return;
 
-    const { url, eventTypes, withCredentials = false } = this.currentOptions;
-    this.eventSource = new EventSource(url, { withCredentials });
+    const { eventTypes, withCredentials = false, parseJson = true } = this.currentOptions;
+    this.eventSource = new EventSource(this.resumeUrl(), { withCredentials });
 
     this.eventSource.onopen = () => {
       this.reconnectAttempts = 0;
@@ -182,18 +186,29 @@ export class SSECoordinator {
 
     eventTypes.forEach(type => {
       this.eventSource!.addEventListener(type, (e: MessageEvent) => {
-        try {
-          const event: SSEEvent = {
-            type,
-            data: JSON.parse(e.data),
-            id: e.lastEventId,
-            timestamp: new Date().toISOString(),
-          };
-          this.currentOptions?.onEvent(event);
-          this.broadcastEvent(event);
-        } catch {
-          this.log('error', `Failed to parse event: ${type}`);
+        let data: unknown;
+        if (parseJson) {
+          try {
+            data = JSON.parse(e.data);
+          } catch {
+            // Malformed payload: log and skip rather than deliver garbage.
+            // Use parseJson: false for non-JSON streams.
+            this.log('error', `Failed to parse event as JSON: ${type}`);
+            return;
+          }
+        } else {
+          data = e.data;
         }
+
+        if (e.lastEventId) this.lastEventId = e.lastEventId;
+        const event: SSEEvent = {
+          type,
+          data,
+          id: e.lastEventId,
+          timestamp: new Date().toISOString(),
+        };
+        this.currentOptions?.onEvent(event);
+        this.broadcastEvent(event);
       });
     });
 
@@ -203,6 +218,22 @@ export class SSECoordinator {
       this.log('warn', 'Leader connection error');
       this.handleReconnect();
     };
+  }
+
+  // Builds the URL used to open the EventSource. When lastEventIdParam is
+  // configured and an event id is known, appends it so a cooperating server can
+  // resume the stream — including after a manual reconnect or leader handover.
+  private resumeUrl(): string {
+    const opts = this.currentOptions!;
+    if (!opts.lastEventIdParam || !this.lastEventId) return opts.url;
+    try {
+      const base = typeof window !== 'undefined' ? window.location.href : undefined;
+      const u = new URL(opts.url, base);
+      u.searchParams.set(opts.lastEventIdParam, this.lastEventId);
+      return u.toString();
+    } catch {
+      return opts.url;
+    }
   }
 
   private closeEventSource(): void {
@@ -225,6 +256,7 @@ export class SSECoordinator {
     this.lockAbortController = null;
     this.currentOptions = null;
     this.reconnectAttempts = 0;
+    this.lastEventId = null;
   }
 
   private handleReconnect(): void {

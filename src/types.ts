@@ -17,7 +17,21 @@ export interface SSECoordinatorOptions {
   eventTypes: string[];
   channelName?: string;
   withCredentials?: boolean;
+  /**
+   * Whether to `JSON.parse` each event's `data` (default `true`). When `true`,
+   * payloads that fail to parse are logged and skipped. Set to `false` for
+   * plain-text or custom-format streams: `data` is then delivered as the raw
+   * string, untouched.
+   */
+  parseJson?: boolean;
   maxReconnectAttempts?: number;
+  /**
+   * When set, the most recent event id is appended to the connection URL as
+   * this query parameter on every (re)connect and on leader handover, letting
+   * a cooperating server resume the stream from where it left off. The server
+   * must read this parameter. Omit it to disable resumption.
+   */
+  lastEventIdParam?: string;
   logger?: Logger;
   onEvent: (event: SSEEvent) => void;
   onError?: (error: Error) => void;

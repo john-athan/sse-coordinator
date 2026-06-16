@@ -379,3 +379,123 @@ describe('SSECoordinator - closeEventSource', () => {
     expect((coordinator as any).eventSource).toBeNull();
   });
 });
+
+describe('SSECoordinator - Last-Event-ID resume', () => {
+  it('appends the last event id to the URL on reconnect when lastEventIdParam is set', () => {
+    coordinator = new SSECoordinator();
+    coordinator.connect({
+      url: TEST_URL,
+      eventTypes: TEST_EVENTS,
+      lastEventIdParam: 'lastEventId',
+      onEvent: () => {},
+    });
+
+    createdEventSources[0].fireNamedEvent('message', { hi: 1 }, 'ev-42');
+
+    (coordinator as any).reconnectAttempts = 1;
+    (coordinator as any).handleReconnect();
+    jest.advanceTimersByTime(5000);
+
+    const latest = createdEventSources[createdEventSources.length - 1];
+    expect(latest.url).toContain('lastEventId=ev-42');
+  });
+
+  it('leaves the URL untouched when lastEventIdParam is not set', () => {
+    coordinator = new SSECoordinator();
+    coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: () => {} });
+
+    createdEventSources[0].fireNamedEvent('message', { hi: 1 }, 'ev-42');
+    (coordinator as any).reconnectAttempts = 1;
+    (coordinator as any).handleReconnect();
+    jest.advanceTimersByTime(5000);
+
+    const latest = createdEventSources[createdEventSources.length - 1];
+    expect(latest.url).toBe(TEST_URL);
+  });
+
+  it('does not append a param until an event has actually been seen', () => {
+    coordinator = new SSECoordinator();
+    coordinator.connect({
+      url: TEST_URL,
+      eventTypes: TEST_EVENTS,
+      lastEventIdParam: 'lastEventId',
+      onEvent: () => {},
+    });
+
+    (coordinator as any).reconnectAttempts = 1;
+    (coordinator as any).handleReconnect();
+    jest.advanceTimersByTime(5000);
+
+    const latest = createdEventSources[createdEventSources.length - 1];
+    expect(latest.url).toBe(TEST_URL);
+  });
+
+  it('ignores empty lastEventId, keeping the previous one', () => {
+    coordinator = new SSECoordinator();
+    coordinator.connect({
+      url: TEST_URL,
+      eventTypes: TEST_EVENTS,
+      lastEventIdParam: 'lastEventId',
+      onEvent: () => {},
+    });
+
+    createdEventSources[0].fireNamedEvent('message', { a: 1 }, 'ev-7');
+    createdEventSources[0].fireNamedEvent('message', { b: 2 }, ''); // no id on this one
+
+    (coordinator as any).reconnectAttempts = 1;
+    (coordinator as any).handleReconnect();
+    jest.advanceTimersByTime(5000);
+
+    const latest = createdEventSources[createdEventSources.length - 1];
+    expect(latest.url).toContain('lastEventId=ev-7');
+  });
+
+  it('tracks the last event id from broadcast events received as a follower', () => {
+    coordinator = new SSECoordinator();
+    coordinator.connect({
+      url: TEST_URL,
+      eventTypes: TEST_EVENTS,
+      lastEventIdParam: 'lastEventId',
+      onEvent: () => {},
+    });
+    (coordinator as any).isLeaderTab = false;
+
+    coordinator.handleBroadcastMessage({
+      type: 'sse-event',
+      tabId: 'leader-tab',
+      event: { type: 'message', data: {}, id: 'ev-77', timestamp: '' },
+    });
+
+    expect((coordinator as any).lastEventId).toBe('ev-77');
+  });
+});
+
+describe('SSECoordinator - raw (non-JSON) payloads', () => {
+  it('delivers the raw string data when parseJson is false', () => {
+    const received: SSEEvent[] = [];
+    coordinator = new SSECoordinator();
+    coordinator.connect({
+      url: TEST_URL,
+      eventTypes: TEST_EVENTS,
+      parseJson: false,
+      onEvent: e => received.push(e),
+    });
+
+    const handlers = (createdEventSources[0] as any).listeners.get('message') ?? [];
+    handlers.forEach((h: any) => h(new MessageEvent('message', { data: 'plain text', lastEventId: 'r-1' })));
+
+    expect(received).toHaveLength(1);
+    expect(received[0].data).toBe('plain text');
+    expect(received[0].id).toBe('r-1');
+  });
+
+  it('still parses JSON by default', () => {
+    const received: SSEEvent[] = [];
+    coordinator = new SSECoordinator();
+    coordinator.connect({ url: TEST_URL, eventTypes: TEST_EVENTS, onEvent: e => received.push(e) });
+
+    createdEventSources[0].fireNamedEvent('message', { n: 5 });
+
+    expect(received[0].data).toEqual({ n: 5 });
+  });
+});
