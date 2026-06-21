@@ -4,12 +4,25 @@
 [![bundle size](https://img.shields.io/bundlephobia/minzip/sse-coordinator)](https://bundlephobia.com/package/sse-coordinator)
 [![license](https://img.shields.io/npm/l/sse-coordinator)](./LICENSE)
 [![TypeScript](https://img.shields.io/badge/TypeScript-ready-blue)](https://www.typescriptlang.org/)
+[![Open the live demo on StackBlitz](https://img.shields.io/badge/live%20demo-StackBlitz-1389FD)](https://stackblitz.com/github/john-athan/sse-coordinator/tree/main/examples/demo)
 
 Share a single SSE connection across all browser tabs using BroadcastChannel leader election.
 
+**[▶ Try the live demo](https://stackblitz.com/github/john-athan/sse-coordinator/tree/main/examples/demo)** — open it in 2+ tabs and watch one become leader.
+
 ## The Problem
 
-Browsers limit HTTP/1.1 connections to 6–8 per domain. Each tab opening its own `EventSource` exhausts this pool — 10 tabs means 10 SSE connections, blocking all other requests.
+Browsers limit HTTP/1.1 connections to 6–8 per domain. Each tab opening its own `EventSource` exhausts this pool — 10 tabs means 10 SSE connections, blocking all other requests to your API. Past the cap, new requests fail with `net::ERR_INSUFFICIENT_RESOURCES` (Chrome) or simply hang.
+
+```
+WITHOUT sse-coordinator              WITH sse-coordinator
+Tab 1 ──SSE──▶ \                     Tab 1 ──SSE──▶ Your Server
+Tab 2 ──SSE──▶  \  6-connection      Tab 2 ──┐
+Tab 3 ──SSE──▶   } browser cap       Tab 3 ──┤ BroadcastChannel
+Tab 4 ──SSE──▶   } reached —         Tab 4 ──┘ (0 extra connections)
+Tab 5 ──SSE──▶  /  other API
+Tab 6 ──SSE──▶ /   requests BLOCKED  1 connection total, always
+```
 
 ## The Solution
 
@@ -22,7 +35,21 @@ Tab 3 (follower) ◀──┤── BroadcastChannel
 Tab 4 (follower) ◀──┘
 ```
 
-When the leader tab closes, a follower automatically promotes itself and opens a new connection.
+When the leader tab closes or crashes, a follower automatically promotes itself and opens a new connection — no heartbeats, no gap:
+
+```mermaid
+sequenceDiagram
+    participant S as Your Server
+    participant L as Tab 1 (leader)
+    participant F as Tab 2 (follower)
+    S-->>L: SSE events
+    L->>F: BroadcastChannel fan-out
+    Note over L: leader tab closes / crashes
+    Note over L,F: browser releases Web Lock,<br/>grants it to next queued tab
+    F->>S: opens new EventSource
+    S-->>F: SSE events
+    Note over F: Tab 2 is now leader
+```
 
 ## Install
 
@@ -127,6 +154,34 @@ coordinator.connect({
   onEvent: () => {},
 });
 ```
+
+## vs SharedWorker / Service Worker
+
+You can also share a connection from a `SharedWorker` or `ServiceWorker`, but:
+
+| | `sse-coordinator` | SharedWorker | ServiceWorker |
+|---|---|---|---|
+| Setup | one import, no extra file | separate worker file + bundler config | separate file + registration + scope |
+| Safari support | ✓ | ✗ (no SharedWorker) | ✓ |
+| Runs your app code | yes — leader is a real tab with full app context | no — isolated worker scope | no — isolated, can be killed anytime |
+| Survives all tabs closing | no (intentional — nothing to receive) | no | yes (but unreliable lifetime) |
+| Failover | automatic via Web Locks | manual | manual |
+
+If you need a connection that outlives every tab, use a ServiceWorker. For sharing one SSE stream **across open tabs** with the least friction, this library.
+
+## FAQ / Symptoms
+
+**Seeing `net::ERR_INSUFFICIENT_RESOURCES` or requests that hang once several tabs are open?**
+You've hit the browser's per-domain connection cap (6–8 on HTTP/1.1). Each `EventSource` holds one slot for its whole lifetime. This library collapses all tabs down to a single connection — see [The Problem](#the-problem).
+
+**Why do my SSE events arrive twice / N times?**
+Every tab opened its own `EventSource`. Route them through one coordinator so a single leader connection fans out over `BroadcastChannel`.
+
+**Does this work over HTTP/2 or HTTP/3?**
+HTTP/2 multiplexes streams so the 6-connection limit is far less painful, but a connection per tab still costs server resources (open streams, auth, backend fan-out). Sharing one stream still helps; on HTTP/1.1 it's essential.
+
+**What happens when the last tab closes?**
+The connection closes. There's no tab left to receive events — by design. The next tab to open becomes leader and reconnects.
 
 ## Browser Support
 

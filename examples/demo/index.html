@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sse-coordinator live demo</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: ui-sans-serif, system-ui, -apple-system, sans-serif;
+        max-width: 640px; margin: 2rem auto; padding: 0 1rem; line-height: 1.5;
+      }
+      h1 { font-size: 1.4rem; margin-bottom: 0.25rem; }
+      .sub { opacity: 0.7; margin-top: 0; }
+      .role {
+        display: inline-block; padding: 0.4rem 0.9rem; border-radius: 999px;
+        font-weight: 700; letter-spacing: 0.03em; font-size: 1.1rem;
+      }
+      .leader { background: #16a34a; color: #fff; }
+      .follower { background: #6366f1; color: #fff; }
+      .pending { background: #9ca3af; color: #fff; }
+      .grid { display: flex; gap: 1.5rem; margin: 1rem 0; flex-wrap: wrap; }
+      .stat { font-size: 0.85rem; opacity: 0.8; }
+      .stat b { display: block; font-size: 1.6rem; opacity: 1; }
+      .dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+      .on { background: #16a34a; } .off { background: #dc2626; }
+      button {
+        padding: 0.5rem 1rem; border-radius: 8px; border: 1px solid currentColor;
+        background: transparent; cursor: pointer; font: inherit;
+      }
+      #log {
+        margin-top: 1rem; padding: 0.75rem; height: 180px; overflow-y: auto;
+        background: rgba(127,127,127,0.1); border-radius: 8px;
+        font-family: ui-monospace, monospace; font-size: 0.8rem;
+      }
+      .hint { background: rgba(99,102,241,0.12); padding: 0.75rem 1rem; border-radius: 8px; }
+    </style>
+  </head>
+  <body>
+    <h1>sse-coordinator — live demo</h1>
+    <p class="sub">One SSE connection shared across every tab.</p>
+
+    <p class="hint">
+      👉 <b>Open this page in 2 or more tabs.</b> Exactly one becomes the
+      <b>LEADER</b> (holds the connection); the rest are <b>followers</b>
+      receiving events over BroadcastChannel. Close the leader tab — a follower
+      is promoted instantly.
+    </p>
+
+    <p>This tab is: <span id="role" class="role pending">connecting…</span></p>
+
+    <div class="grid">
+      <div class="stat">connection <b><span class="dot off" id="dot"></span></b></div>
+      <div class="stat">events received <b id="count">0</b></div>
+      <div class="stat">latest count <b id="latest">—</b></div>
+    </div>
+
+    <button id="toggle">Disconnect this tab</button>
+
+    <div id="log"></div>
+
+    <script type="module">
+      import { SSECoordinator } from 'https://esm.sh/sse-coordinator';
+
+      const $ = (id) => document.getElementById(id);
+      const log = (m) => {
+        const line = document.createElement('div');
+        line.textContent = `${new Date().toLocaleTimeString()}  ${m}`;
+        $('log').prepend(line);
+      };
+
+      let count = 0;
+      let connected = false;
+      const coordinator = new SSECoordinator();
+
+      function renderRole() {
+        const el = $('role');
+        if (coordinator.isLeader()) {
+          el.textContent = 'LEADER (owns the EventSource)';
+          el.className = 'role leader';
+        } else {
+          el.textContent = 'follower (via BroadcastChannel)';
+          el.className = 'role follower';
+        }
+      }
+
+      function start() {
+        coordinator.connect({
+          url: '/events',
+          eventTypes: ['tick'],
+          onEvent(event) {
+            count += 1;
+            $('count').textContent = count;
+            $('latest').textContent = event.data.count;
+            log(`tick #${event.data.count}`);
+            renderRole();
+          },
+          onConnectionChange(isConnected) {
+            connected = isConnected;
+            $('dot').className = 'dot ' + (isConnected ? 'on' : 'off');
+            log(isConnected ? 'connection OPEN' : 'connection closed');
+            renderRole();
+          },
+          onError(err) { log('ERROR: ' + err.message); },
+        });
+        // Role isn't known synchronously (lock is granted async); poll briefly.
+        const t = setInterval(renderRole, 500);
+        setTimeout(() => clearInterval(t), 5000);
+        log('connect() called');
+      }
+
+      let running = true;
+      $('toggle').onclick = () => {
+        if (running) {
+          coordinator.disconnect();
+          running = false;
+          $('toggle').textContent = 'Reconnect this tab';
+          $('role').textContent = 'disconnected';
+          $('role').className = 'role pending';
+          log('disconnect() — if this was the leader, another tab takes over');
+        } else {
+          running = true;
+          $('toggle').textContent = 'Disconnect this tab';
+          start();
+        }
+      };
+
+      start();
+    </script>
+  </body>
+</html>
