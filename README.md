@@ -8,7 +8,7 @@
 
 Share a single SSE connection across all browser tabs using BroadcastChannel leader election.
 
-**[▶ Try the live demo](https://stackblitz.com/github/john-athan/sse-coordinator/tree/main/examples/demo)** — open it in 2+ tabs and watch one become leader.
+**[▶ Try the live demo](./examples/demo)** — run it in 2+ tabs and watch one become leader (see [demo notes](./examples/demo#readme) — cross-tab coordination needs the same origin).
 
 ## The Problem
 
