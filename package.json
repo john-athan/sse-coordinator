@@ -1,8 +1,23 @@
 {
   "name": "sse-coordinator",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Share a single SSE connection across browser tabs using BroadcastChannel leader election",
-  "keywords": ["sse", "server-sent-events", "broadcast-channel", "multi-tab", "leader-election", "eventsource", "web-locks", "sharedworker", "realtime", "tab-coordination", "connection-limit", "multiplex", "eventsource-shared", "cross-tab"],
+  "keywords": [
+    "sse",
+    "server-sent-events",
+    "broadcast-channel",
+    "multi-tab",
+    "leader-election",
+    "eventsource",
+    "web-locks",
+    "sharedworker",
+    "realtime",
+    "tab-coordination",
+    "connection-limit",
+    "multiplex",
+    "eventsource-shared",
+    "cross-tab"
+  ],
   "license": "MIT",
   "author": "Jonathan Kaleve",
   "homepage": "https://github.com/john-athan/sse-coordinator#readme",
@@ -22,7 +37,9 @@
       "require": "./dist/index.cjs"
     }
   },
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsup",
     "test": "bun test",
