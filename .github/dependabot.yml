@@ -10,6 +10,11 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # tsup 8.x bundles rollup-plugin-dts, which is incompatible with
+      # TypeScript 7 (DTS build fails). Re-enable once tsup supports TS 7.
+      - dependency-name: "typescript"
+        update-types: ["version-update:semver-major"]
 
   - package-ecosystem: github-actions
     directory: "/"
