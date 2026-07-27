@@ -4,10 +4,13 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 1
     groups:
-      npm-minor-patch:
+      npm:
+        patterns:
+          - "*"
         update-types:
+          - major
           - minor
           - patch
     ignore:
@@ -20,7 +23,12 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 1
     groups:
       github-actions:
         patterns:
           - "*"
+        update-types:
+          - major
+          - minor
+          - patch
